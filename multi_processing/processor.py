@@ -1,12 +1,11 @@
-# llm_processor/processor.py
+# multi_processing/processor.py
 
 import os
 import json
 import time
 import hashlib
 import concurrent.futures
-from typing import List, Callable, Dict, Any, Optional, Union, Type
-from functools import partial
+from typing import List, Callable, Dict, Any, Optional, Union
 from tqdm import tqdm
 import pandas as pd
 from datetime import datetime
@@ -17,9 +16,11 @@ from .llm_client import BaseLLMClient
 class LLMProcessor:
     """High-performance batch processor for LLM operations"""
 
-    def __init__(self, 
-                 llm_client: BaseLLMClient,
-                 config: Optional[ProcessorConfig] = None):
+    def __init__(
+        self, 
+        llm_client: BaseLLMClient,
+        config: Optional[ProcessorConfig] = None
+    ):
         """
         Initialize processor with LLM client and config.
         
@@ -33,8 +34,8 @@ class LLMProcessor:
         # Validate config
         if not self.config.validate():
             raise ValueError("Invalid configuration")
-            
-        # Setup cache directory
+        
+        # Setup cache directory (if caching is on)
         os.makedirs(self.config.cache_dir, exist_ok=True)
         
         # Initialize metrics tracking
@@ -49,12 +50,15 @@ class LLMProcessor:
 
     def _generate_cache_key(self, input_data: Any, prefix: str = "") -> str:
         """Generate unique cache key including relevant metadata"""
+        data_str = ""
         if isinstance(input_data, (str, int, float, bool)):
             data_str = str(input_data)
         else:
-            data_str = json.dumps(input_data, sort_keys=True)
+            try:
+                data_str = json.dumps(input_data, sort_keys=True)
+            except:
+                data_str = str(input_data)
         
-        # Include relevant context in cache key
         context = {
             'input': data_str,
             'prefix': prefix,
@@ -107,33 +111,33 @@ class LLMProcessor:
         cache_prefix: str = "",
         use_cache: bool = True,
     ) -> Optional[Dict]:
-        """Process single item with enhanced retry logic and monitoring"""
+        """Process single item with retry/backoff and optional caching."""
         cache_key = self._generate_cache_key(item, cache_prefix)
         
-        # Check cache first if enabled
+        # 1. Check the cache first
         if use_cache and self.config.cache_enabled:
             cached = self._load_from_cache(cache_key)
             if cached is not None:
                 return cached
 
-        # Retry loop with exponential backoff
+        # 2. Retry loop
         for attempt in range(self.config.max_retries):
             try:
-                # Apply rate limiting if configured
+                # Rate limiting
                 if self.config.rate_limit > 0:
                     time.sleep(self.config.rate_limit)
                 
-                # Process item
+                # Actual processing
                 start_time = time.time()
                 result = process_fn(item)
                 process_time = time.time() - start_time
                 
-                # Track metrics
+                # Update metrics
                 self.metrics['total_processed'] += 1
                 self.metrics['batch_times'].append(process_time)
                 
-                # Cache successful result
-                if result is not None and use_cache:
+                # Cache if successful
+                if result is not None and use_cache and self.config.cache_enabled:
                     self._save_to_cache(cache_key, result)
                     
                 return result
@@ -142,6 +146,7 @@ class LLMProcessor:
                 error_msg = f"Error processing item: {str(e)}"
                 self._log_error(error_msg, cache_key)
                 
+                # Exponential backoff only if more attempts remain
                 if attempt < self.config.max_retries - 1:
                     delay = self.config.retry_delay * (2 ** attempt)
                     time.sleep(delay)
@@ -154,93 +159,90 @@ class LLMProcessor:
         self,
         items: List[Any],
         process_fn: Callable[[Any], Dict],
-        transform_fn: Optional[Callable[[Dict], List[Dict]]] = None,
         cache_prefix: str = "",
-        use_cache: bool = True,
-        output_path: Optional[str] = None
+        use_cache: bool = False,
+        desc: str = "Processing items"
     ) -> List[Dict]:
         """
-        Process items in batches with enhanced monitoring and error handling
+        Master method for concurrency. Behavior depends on:
+          - self.config.enable_batch_prompts
+          - self.config.batch_size
+
+        If enable_batch_prompts = True:
+          We chunk items into sub-batches of size batch_size. Each sub-batch is
+          considered "one item" to _process_with_retry. We pass the entire sub-batch to `process_fn`.
+
+        If enable_batch_prompts = False:
+          We do item-level concurrency (one item => one future).
         """
-        all_results = []
-        failed_items = []
-        
-        # Setup progress bar
-        indices = range(0, len(items), self.config.batch_size)
-        pbar = tqdm(indices, disable=not self.config.show_progress)
-        
-        batch_start_time = time.time()
-        
-        for batch_i in pbar:
-            batch_data = items[batch_i : batch_i + self.config.batch_size]
-            
-            # Process batch with thread pool
-            with concurrent.futures.ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
-                fn = partial(
-                    self._process_with_retry,
-                    process_fn=process_fn,
-                    cache_prefix=cache_prefix,
-                    use_cache=use_cache
-                )
-                batch_results = list(executor.map(fn, batch_data))
-            
-            # Transform results if needed
-            if transform_fn:
-                transformed_batch = []
-                for br in batch_results:
-                    if br is not None:
+        # If we want to combine multiple items into one "prompt", chunk them:
+        if self.config.enable_batch_prompts:
+            # Each sub-batch is a list (or sub-DataFrame) of items
+            subbatches = []
+            for i in range(0, len(items), self.config.batch_size):
+                batch = items[i : i + self.config.batch_size]
+                subbatches.append(batch)
+
+            # We'll spawn concurrency across sub-batches, not individual items
+            with tqdm(total=len(subbatches), desc=desc) as pbar:
+                results = []
+                with concurrent.futures.ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
+                    futures = []
+                    for subbatch in subbatches:
+                        # subbatch is a list of items
+                        futures.append(
+                            executor.submit(
+                                self._process_with_retry,
+                                subbatch,
+                                process_fn,
+                                cache_prefix,
+                                use_cache
+                            )
+                        )
+                    
+                    for f in concurrent.futures.as_completed(futures):
                         try:
-                            records = transform_fn(br)
-                            transformed_batch.extend(records)
+                            sub_result = f.result()  # This should be a dict containing multiple items' results
+                            if sub_result is not None:
+                                # We assume process_fn returns a dict with *some* structure
+                                # We'll store it in results
+                                results.append(sub_result)
                         except Exception as e:
-                            self._log_error(f"Transform error: {e}", None)
-                batch_results = transformed_batch
-            else:
-                batch_results = [br for br in batch_results if br is not None]
-            
-            # Track failed items
-            for item, result in zip(batch_data, batch_results):
-                if result is None:
-                    failed_items.append(item)
-            
-            all_results.extend(batch_results)
-            
-            # Save progress periodically
-            batch_index = (batch_i // self.config.batch_size) + 1
-            if output_path and (batch_index % self.config.save_interval == 0):
-                self._save_progress(all_results, output_path)
-            
-            # Update progress bar with metrics
-            elapsed = time.time() - batch_start_time
-            processed_count = len(all_results)
-            
-            postfix_dict = {
-                'processed': processed_count,
-                'success_rate': f"{processed_count/len(items):.1%}" if items else "0%",
-                'errors': self.metrics['errors'],
-            }
-            
-            # Only add average time if we have processed items
-            if processed_count > 0:
-                postfix_dict['avg_time'] = f"{elapsed/processed_count:.2f}s"
-            else:
-                postfix_dict['avg_time'] = "N/A"
-                
-            pbar.set_postfix(postfix_dict)
-        
-        # Save final results
-        if output_path:
-            self._save_progress(all_results, output_path)
-        
-        # Save failed items if configured
-        if self.config.error_output_path and failed_items:
-            self._save_failed_items(failed_items)
-        
-        # Save metrics if configured
-        if self.config.metrics_output_path:
-            self._save_metrics()
-        
-        return all_results
+                            print(f"Sub-batch processing failed: {e}")
+                        finally:
+                            pbar.update(1)
+
+                return results
+
+        else:
+            # Item-level concurrency
+            results = []
+            with tqdm(total=len(items), desc=desc) as pbar:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
+                    futures = []
+                    for item in items:
+                        futures.append(
+                            executor.submit(
+                                self._process_with_retry,
+                                item,
+                                process_fn,
+                                cache_prefix,
+                                use_cache
+                            )
+                        )
+
+                    for future in concurrent.futures.as_completed(futures):
+                        try:
+                            r = future.result()
+                            if r is not None:
+                                results.append(r)
+                        except Exception as e:
+                            print(f"Item processing failed: {e}")
+                        finally:
+                            # Update progress by 1
+                            pbar.update(1)
+
+            return results
 
     def _save_progress(self, results: List[Dict], output_path: str):
         """Save progress with format handling"""
@@ -266,15 +268,21 @@ class LLMProcessor:
     def _save_metrics(self):
         """Save processing metrics"""
         try:
+            if len(self.metrics['batch_times']) > 0:
+                avg_time = sum(self.metrics['batch_times']) / len(self.metrics['batch_times'])
+            else:
+                avg_time = 0.0
+
             metrics = {
                 **self.metrics,
                 'end_time': time.time(),
                 'total_time': time.time() - self.metrics['start_time'],
-                'avg_process_time': sum(self.metrics['batch_times']) / len(self.metrics['batch_times'])
+                'avg_process_time': avg_time
             }
             
-            with open(self.config.metrics_output_path, 'w') as f:
-                json.dump(metrics, f, indent=2)
+            if self.config.metrics_output_path:
+                with open(self.config.metrics_output_path, 'w') as f:
+                    json.dump(metrics, f, indent=2)
         except Exception as e:
             print(f"Error saving metrics: {e}")
 

@@ -1,4 +1,4 @@
-# llm_processor/processor_config.py
+# multi_processing/processor_config.py
 
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
@@ -8,17 +8,18 @@ class ProcessorConfig:
     """Configuration for LLM batch processor"""
     
     # Batch Processing
-    batch_size: int = 20
-    max_workers: int = 5
-    
+    batch_size: int = 1
+    max_workers: int = 10
+    enable_batch_prompts: bool = False  # <--- ADDED
+
     # Retry Logic
-    max_retries: int = 3
-    retry_delay: float = 1.0
+    max_retries: int = 1
+    retry_delay: float = 0.0
     
     # Caching
     cache_dir: str = "llm_cache"
     cache_format: str = "json"
-    cache_enabled: bool = True
+    cache_enabled: bool = False
     
     # Progress & Saving
     save_interval: int = 1
@@ -26,19 +27,18 @@ class ProcessorConfig:
     output_format: str = "csv"
     
     # Rate Limiting
-    rate_limit: float = 0.0  # Seconds between API calls
-    dynamic_rate_limit: bool = False  # Adjust based on response times
+    rate_limit: float = 0.0  
+    dynamic_rate_limit: bool = False  
     
     # Error Handling
-    fail_fast: bool = False  # Stop on first error
-    error_output_path: Optional[str] = None  # Save failed items
+    fail_fast: bool = False
+    error_output_path: Optional[str] = None
     
     # Monitoring
     track_metrics: bool = True
     metrics_output_path: Optional[str] = None
     
     def to_dict(self) -> Dict[str, Any]:
-        """Convert config to dictionary"""
         return {
             field.name: getattr(self, field.name) 
             for field in self.__dataclass_fields__.values()
@@ -46,14 +46,12 @@ class ProcessorConfig:
     
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> 'ProcessorConfig':
-        """Create config from dictionary"""
         return cls(**{
             k: v for k, v in config_dict.items() 
             if k in cls.__dataclass_fields__
         })
     
     def validate(self) -> bool:
-        """Validate configuration values"""
         try:
             assert self.batch_size > 0, "batch_size must be positive"
             assert self.max_workers > 0, "max_workers must be positive"
