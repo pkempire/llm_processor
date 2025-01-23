@@ -1,7 +1,7 @@
-# multi_processing/processor_config.py
+# llm_processor/processor_config.py
 
 from dataclasses import dataclass
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Callable
 
 @dataclass
 class ProcessorConfig:
@@ -10,8 +10,13 @@ class ProcessorConfig:
     # Batch Processing
     batch_size: int = 1
     max_workers: int = 10
-    enable_batch_prompts: bool = False  # <--- ADDED
+    enable_batch_prompts: bool = False
 
+    # Dynamic token-based batching
+    enable_dynamic_token_batching: bool = False
+    max_tokens_per_batch: int = 2000
+    token_counter_fn: Optional[Callable[[Any], int]] = None  # function to measure tokens
+    
     # Retry Logic
     max_retries: int = 1
     retry_delay: float = 0.0
@@ -38,6 +43,20 @@ class ProcessorConfig:
     track_metrics: bool = True
     metrics_output_path: Optional[str] = None
     
+    # Add these fields:
+    checkpoint_dir: Optional[str] = None
+    checkpoint_interval: int = 100  # Save checkpoint every N items
+    
+    # Improved backoff settings
+    min_retry_delay: float = 1.0
+    max_retry_delay: float = 300.0  # 5 minutes
+    backoff_factor: float = 2.0
+    jitter: bool = True
+    
+    # Rate limiting improvements
+    requests_per_minute: Optional[int] = None
+    concurrent_request_limit: Optional[int] = None
+    
     def to_dict(self) -> Dict[str, Any]:
         return {
             field.name: getattr(self, field.name) 
@@ -58,6 +77,7 @@ class ProcessorConfig:
             assert self.max_retries >= 0, "max_retries must be non-negative"
             assert self.retry_delay >= 0, "retry_delay must be non-negative"
             assert self.rate_limit >= 0, "rate_limit must be non-negative"
+            assert self.max_tokens_per_batch > 0, "max_tokens_per_batch must be > 0"
             return True
         except AssertionError as e:
             print(f"Invalid configuration: {e}")

@@ -9,9 +9,22 @@ from typing import List, Callable, Dict, Any, Optional, Union
 from tqdm import tqdm
 import pandas as pd
 from datetime import datetime
+import random
 
 from .processor_config import ProcessorConfig
 from .llm_client import BaseLLMClient
+
+from .batching_utils import dynamic_token_batch, default_token_counter
+
+#TODO: dynamic token chunking: utomatically chunk big transcripts or texts so you don't exceed token limits.
+#TODO: exponential backoff with API's. scale concurrency with 
+#TODO: Checkpointing so you can pause/resume processing large datasets without redoing everything.
+#3) Long-Document Summarization / Indexing
+#Problem: Large docs exceed token limits or are too slow if done line by line.
+#Building a pipeline that (a) splits docs into sections, (b) runs concurrency for summaries, (c) merges or organizes them.
+#1. High-volume offline data processing: concurrency + checkpointing + caching → reduces multi-hour jobs to minutes.
+#2. Real-time request handling: dynamic concurrency, load balancing, rate limiting → keep latencies low, handle spikes.
+#3. Agent or multi-step reasoning: managing repeated LLM calls in a single user flow, or tool + LLM interplay.
 
 class LLMProcessor:
     """High-performance batch processor for LLM operations"""
@@ -148,7 +161,7 @@ class LLMProcessor:
                 
                 # Exponential backoff only if more attempts remain
                 if attempt < self.config.max_retries - 1:
-                    delay = self.config.retry_delay * (2 ** attempt)
+                    delay = self._implement_backoff(attempt)
                     time.sleep(delay)
                 else:
                     self.metrics['errors'] += 1
@@ -164,32 +177,41 @@ class LLMProcessor:
         desc: str = "Processing items"
     ) -> List[Dict]:
         """
-        Master method for concurrency. Behavior depends on:
-          - self.config.enable_batch_prompts
-          - self.config.batch_size
-
-        If enable_batch_prompts = True:
-          We chunk items into sub-batches of size batch_size. Each sub-batch is
-          considered "one item" to _process_with_retry. We pass the entire sub-batch to `process_fn`.
-
-        If enable_batch_prompts = False:
-          We do item-level concurrency (one item => one future).
+        Master method for concurrency. Supports:
+          1. Dynamic token-based batching (if enabled).
+          2. Regular sub-batch concurrency (if enable_batch_prompts=True).
+          3. Item-level concurrency otherwise.
         """
-        # If we want to combine multiple items into one "prompt", chunk them:
-        if self.config.enable_batch_prompts:
-            # Each sub-batch is a list (or sub-DataFrame) of items
-            subbatches = []
-            for i in range(0, len(items), self.config.batch_size):
-                batch = items[i : i + self.config.batch_size]
-                subbatches.append(batch)
+        # 1) Possibly do dynamic token-based chunking
+        if self.config.enable_dynamic_token_batching:
+            token_counter = self.config.token_counter_fn or default_token_counter
+            subbatches = dynamic_token_batch(items, self.config.max_tokens_per_batch, token_counter)
+            # We'll replace 'items' with these sub-batches
+            # each sub-batch might contain 1..N items, depending on token usage
+            items = subbatches
+            # Force 'enable_batch_prompts=True' if dynamic token batching is used,
+            # because now each "item" is itself a sub-batch
+            self.config.enable_batch_prompts = True
 
-            # We'll spawn concurrency across sub-batches, not individual items
-            with tqdm(total=len(subbatches), desc=desc) as pbar:
+        # 2) If enable_batch_prompts = True, chunk further by config.batch_size
+        if self.config.enable_batch_prompts:
+            # If dynamic_token_batch was used, 'items' might already be sub-batches,
+            # but user might also want to chunk them again by batch_size. It's optional.
+            # We'll assume we just use 'items' as is if dynamic token batching is used,
+            # else we do the old chunking approach:
+            if not self.config.enable_dynamic_token_batching:
+                subbatches = []
+                for i in range(0, len(items), self.config.batch_size):
+                    batch = items[i : i + self.config.batch_size]
+                    subbatches.append(batch)
+                items = subbatches
+            
+            # Now 'items' is a list of sub-batches
+            with tqdm(total=len(items), desc=desc) as pbar:
                 results = []
                 with concurrent.futures.ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
                     futures = []
-                    for subbatch in subbatches:
-                        # subbatch is a list of items
+                    for subbatch in items:
                         futures.append(
                             executor.submit(
                                 self._process_with_retry,
@@ -202,20 +224,18 @@ class LLMProcessor:
                     
                     for f in concurrent.futures.as_completed(futures):
                         try:
-                            sub_result = f.result()  # This should be a dict containing multiple items' results
+                            sub_result = f.result()
                             if sub_result is not None:
-                                # We assume process_fn returns a dict with *some* structure
-                                # We'll store it in results
                                 results.append(sub_result)
                         except Exception as e:
-                            print(f"Sub-batch processing failed: {e}")
+                            print(f"Sub-batch failed: {e}")
                         finally:
                             pbar.update(1)
 
                 return results
 
         else:
-            # Item-level concurrency
+            # 3) Item-level concurrency
             results = []
             with tqdm(total=len(items), desc=desc) as pbar:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
@@ -239,11 +259,10 @@ class LLMProcessor:
                         except Exception as e:
                             print(f"Item processing failed: {e}")
                         finally:
-                            # Update progress by 1
                             pbar.update(1)
 
             return results
-
+        
     def _save_progress(self, results: List[Dict], output_path: str):
         """Save progress with format handling"""
         try:
@@ -296,3 +315,30 @@ class LLMProcessor:
         self.metrics['error_logs'].append(error_entry)
         if self.config.fail_fast:
             raise Exception(error_msg)
+
+    def checkpoint_state(self, items: List[Any], processed_items: List[Any], checkpoint_path: str):
+        """Save processing state for resume capability"""
+        checkpoint = {
+            'remaining_items': items,
+            'processed_items': processed_items,
+            'metrics': self.metrics,
+            'timestamp': datetime.now().isoformat()
+        }
+        with open(checkpoint_path, 'w') as f:
+            json.dump(checkpoint, f)
+
+    def resume_from_checkpoint(self, checkpoint_path: str) -> tuple[List[Any], List[Any]]:
+        """Resume processing from a saved checkpoint"""
+        with open(checkpoint_path, 'r') as f:
+            checkpoint = json.load(f)
+        self.metrics = checkpoint['metrics']
+        return checkpoint['remaining_items'], checkpoint['processed_items']
+
+    def _implement_backoff(self, attempt: int) -> float:
+        """Implement proper exponential backoff with jitter"""
+        if attempt == 0:
+            return 0
+        base_delay = self.config.retry_delay
+        max_delay = min(300, base_delay * (2 ** attempt))  # Cap at 5 minutes
+        jitter = random.uniform(0, 0.1 * max_delay)
+        return max_delay + jitter
