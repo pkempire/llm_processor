@@ -6,6 +6,7 @@ Built for:
 1. **High-volume offline data processing** – concurrency + checkpointing + caching → reduces multi-hour jobs to minutes.  
 2. **Real-time request handling** – dynamic concurrency, load balancing, rate limiting → keep latencies low and handle spikes.  
 3. **Agent or multi-step reasoning** – managing repeated LLM calls in a single user flow, or tool + LLM interplay.
+4. **Synthetic Data Generation** 
 
 **Examples are using DeepSeek API** as they have **No Rate Limit** (or adapt to your preferred LLM provider).
 
@@ -38,9 +39,19 @@ Built for:
 
 3. **Use it in your projects**:
    ```python
-   from llm_processor.processor import LLMProcessor
-   from llm_processor.processor_config import ProcessorConfig
-   from llm_processor.llm_client import DeepSeekClient  # or OpenAIClient, etc.
+   from llm_processor import LLMProcessor, ProcessorConfig, DeepSeekClient
+
+   # Example configuration
+   config = ProcessorConfig(
+       max_workers=16,
+       batch_size=8,
+       cache_enabled=True,
+       max_retries=3
+   )
+
+   # Initialize client and processor
+   client = DeepSeekClient(api_key="your_api_key_here")
+   processor = LLMProcessor(client, config)
    ```
 
 ---

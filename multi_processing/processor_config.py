@@ -1,7 +1,7 @@
 # llm_processor/processor_config.py
 
-from dataclasses import dataclass
-from typing import Optional, Dict, Any, Callable
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Any, Callable, List
 
 @dataclass
 class ProcessorConfig:
@@ -57,6 +57,22 @@ class ProcessorConfig:
     requests_per_minute: Optional[int] = None
     concurrent_request_limit: Optional[int] = None
     
+    # Cost tracking
+    pricing_models: Dict[str, Dict[str, float]] = field(default_factory=lambda: {
+        'deepseek-chat': {
+            'input': 0.50,  # $0.50 per 1M input tokens
+            'output': 1.50  # $1.50 per 1M output tokens
+        },
+        'gpt-4': {
+            'input': 30.00,
+            'output': 60.00
+        },
+        'gpt-3.5-turbo': {
+            'input': 0.50,
+            'output': 1.50
+        }
+    })
+    
     def to_dict(self) -> Dict[str, Any]:
         return {
             field.name: getattr(self, field.name) 
@@ -70,6 +86,10 @@ class ProcessorConfig:
             if k in cls.__dataclass_fields__
         })
     
+    def copy(self) -> 'ProcessorConfig':
+        """Create a copy of the configuration"""
+        return ProcessorConfig(**self.__dict__)
+
     def validate(self) -> bool:
         try:
             assert self.batch_size > 0, "batch_size must be positive"

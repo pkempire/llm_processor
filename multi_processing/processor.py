@@ -58,7 +58,24 @@ class LLMProcessor:
             'errors': 0,
             'start_time': time.time(),
             'batch_times': [],
-            'error_logs': []
+            'error_logs': [],
+            'api_calls': {
+                'total': 0,
+                'successful': 0,
+                'failed': 0,
+                'retries': 0,
+                'rate_limited': 0,
+                'timeouts': 0
+            },
+            'token_usage': {
+                'input_tokens': 0,
+                'output_tokens': 0,
+                'total_tokens': 0
+            },
+            'throughput': {
+                'items_per_second': 0,
+                'tokens_per_second': 0
+            }
         }
 
     def _generate_cache_key(self, input_data: Any, prefix: str = "") -> str:
@@ -137,8 +154,9 @@ class LLMProcessor:
         for attempt in range(self.config.max_retries):
             try:
                 # Rate limiting
-                if self.config.rate_limit > 0:
-                    time.sleep(self.config.rate_limit)
+                rate_limit = self._calculate_rate_limit()
+                if rate_limit > 0:
+                    time.sleep(rate_limit)
                 
                 # Actual processing
                 start_time = time.time()
@@ -148,6 +166,16 @@ class LLMProcessor:
                 # Update metrics
                 self.metrics['total_processed'] += 1
                 self.metrics['batch_times'].append(process_time)
+                
+                # Update token usage if available
+                if result and 'raw_response' in result:
+                    try:
+                        usage = result['raw_response'].usage
+                        self.metrics['token_usage']['input_tokens'] += usage.prompt_tokens
+                        self.metrics['token_usage']['output_tokens'] += usage.completion_tokens
+                        self.metrics['token_usage']['total_tokens'] += usage.total_tokens
+                    except AttributeError:
+                        pass
                 
                 # Cache if successful
                 if result is not None and use_cache and self.config.cache_enabled:
@@ -159,12 +187,23 @@ class LLMProcessor:
                 error_msg = f"Error processing item: {str(e)}"
                 self._log_error(error_msg, cache_key)
                 
+                # Classify error type and update metrics
+                error_type = self._classify_error(e)
+                self.metrics['errors'] += 1
+                self.metrics['api_calls']['failed'] += 1
+                
+                if error_type == 'rate_limit':
+                    self.metrics['api_calls']['rate_limited'] += 1
+                elif error_type == 'timeout':
+                    self.metrics['api_calls']['timeouts'] += 1
+                
                 # Exponential backoff only if more attempts remain
                 if attempt < self.config.max_retries - 1:
-                    delay = self._implement_backoff(attempt)
+                    delay = self._implement_backoff(attempt, error_type)
+                    self.metrics['api_calls']['retries'] += 1
                     time.sleep(delay)
                 else:
-                    self.metrics['errors'] += 1
+                    self.metrics['api_calls']['failed'] += 1
 
         return None
 
@@ -181,7 +220,14 @@ class LLMProcessor:
           1. Dynamic token-based batching (if enabled).
           2. Regular sub-batch concurrency (if enable_batch_prompts=True).
           3. Item-level concurrency otherwise.
+          4. Dynamic rate limiting and backoff.
+          5. Progress checkpointing.
         """
+        # Initialize checkpointing
+        if self.config.checkpoint_dir:
+            os.makedirs(self.config.checkpoint_dir, exist_ok=True)
+            checkpoint_counter = 0
+            processed_items = []
         # 1) Possibly do dynamic token-based chunking
         if self.config.enable_dynamic_token_batching:
             token_counter = self.config.token_counter_fn or default_token_counter
@@ -334,11 +380,134 @@ class LLMProcessor:
         self.metrics = checkpoint['metrics']
         return checkpoint['remaining_items'], checkpoint['processed_items']
 
-    def _implement_backoff(self, attempt: int) -> float:
-        """Implement proper exponential backoff with jitter"""
+    def _implement_backoff(self, attempt: int, error_type: str = 'generic_error') -> float:
+        """Implement proper exponential backoff with jitter and error-specific delays"""
         if attempt == 0:
             return 0
-        base_delay = self.config.retry_delay
-        max_delay = min(300, base_delay * (2 ** attempt))  # Cap at 5 minutes
-        jitter = random.uniform(0, 0.1 * max_delay)
-        return max_delay + jitter
+
+        # Enhanced error-specific backoff
+        if error_type == 'server_error':
+            base_delay = min(
+                self.config.max_retry_delay,
+                (2 ** attempt) + random.uniform(0, 1)  # Exponential + jitter
+            )
+        else:
+            # Original base delay calculation
+            base_delay = max(
+                self.config.min_retry_delay,
+                min(
+                    self.config.max_retry_delay,
+                    self.config.min_retry_delay * (self.config.backoff_factor ** attempt)
+                )
+            )
+        
+        # Adjust delay based on error type
+        if error_type == 'rate_limit':
+            # Longer delay for rate limit errors
+            base_delay = min(base_delay * 2, self.config.max_retry_delay)
+        elif error_type == 'timeout':
+            # Moderate delay for timeouts
+            base_delay = min(base_delay * 1.5, self.config.max_retry_delay)
+        elif error_type == 'auth_error':
+            # No point retrying auth errors quickly
+            return self.config.max_retry_delay
+        elif error_type == 'server_error':
+            # Moderate delay for server errors
+            base_delay = min(base_delay * 1.2, self.config.max_retry_delay)
+            
+        # Add jitter if enabled
+        if self.config.jitter:
+            jitter = random.uniform(0, 0.1 * base_delay)
+            return base_delay + jitter
+        
+        return base_delay
+
+    def _classify_error(self, error: Exception) -> str:
+        """Classify API errors into specific types"""
+        error_str = str(error).lower()
+        
+        # Rate limit errors
+        if 'rate limit' in error_str or 'too many requests' in error_str:
+            return 'rate_limit'
+            
+        # Timeout errors
+        if 'timeout' in error_str or 'timed out' in error_str:
+            return 'timeout'
+            
+        # Authentication errors
+        if 'unauthorized' in error_str or 'authentication' in error_str:
+            return 'auth_error'
+            
+        # Server errors
+        if 'server error' in error_str or 'internal error' in error_str:
+            return 'server_error'
+            
+        # Network errors
+        if 'connection' in error_str or 'network' in error_str:
+            return 'network_error'
+            
+        # Default to generic error
+        return 'generic_error'
+
+    def _calculate_rate_limit(self) -> float:
+        """Calculate dynamic rate limit based on current conditions"""
+        if not self.config.dynamic_rate_limit:
+            return self.config.rate_limit
+            
+        # Calculate requests per second based on requests_per_minute
+        if self.config.requests_per_minute:
+            return 60.0 / self.config.requests_per_minute
+            
+        # Default to fixed rate limit if no dynamic settings
+        return self.config.rate_limit
+
+    def _calculate_estimated_cost(self) -> Dict[str, float]:
+        """Calculate estimated costs based on token usage and configured pricing models"""
+        model = getattr(self.llm_client, 'model', 'deepseek-chat')
+        model_pricing = self.config.pricing_models.get(model)
+        
+        if not model_pricing:
+            # If no pricing model is configured, return zero costs
+            return {
+                'input_cost': 0.0,
+                'output_cost': 0.0,
+                'total_cost': 0.0
+            }
+        
+        input_cost = (self.metrics['token_usage']['input_tokens'] / 1_000_000) * model_pricing['input']
+        output_cost = (self.metrics['token_usage']['output_tokens'] / 1_000_000) * model_pricing['output']
+        total_cost = input_cost + output_cost
+        
+        return {
+            'input_cost': input_cost,
+            'output_cost': output_cost,
+            'total_cost': total_cost
+        }
+
+    def _update_throughput_stats(self):
+        """Calculate and update real-time throughput statistics"""
+        elapsed_time = time.time() - self.metrics['start_time']
+        if elapsed_time > 0:
+            # Items per second
+            self.metrics['throughput']['items_per_second'] = (
+                self.metrics['total_processed'] / elapsed_time
+            )
+            
+            # Tokens per second
+            self.metrics['throughput']['tokens_per_second'] = (
+                self.metrics['token_usage']['total_tokens'] / elapsed_time
+            )
+            
+            # Display stats every 10 seconds
+            if int(elapsed_time) % 10 == 0:
+                costs = self._calculate_estimated_cost()
+                print(f"\nThroughput Stats:")
+                print(f"- Items processed: {self.metrics['total_processed']}")
+                print(f"- Items/sec: {self.metrics['throughput']['items_per_second']:.2f}")
+                print(f"- Tokens/sec: {self.metrics['throughput']['tokens_per_second']:.2f}")
+                print(f"- Total tokens: {self.metrics['token_usage']['total_tokens']}")
+                print(f"- Estimated cost: ${costs['total_cost']:.4f}")
+                print(f"  - Input: ${costs['input_cost']:.4f}")
+                print(f"  - Output: ${costs['output_cost']:.4f}")
+                print(f"- Cache hits: {self.metrics['cache_hits']}")
+                print(f"- Errors: {self.metrics['errors']}")
