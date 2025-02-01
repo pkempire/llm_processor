@@ -3,23 +3,26 @@ HyperLLM
 A high-performance Python library for batch processing and concurrency of LLM API calls, achieving up to 1000x faster speeds than sequential API calls.
 
 Built for:
-1. **High-volume offline data processing** – concurrency + checkpointing + caching → reduces multi-hour jobs to minutes.  
+1. **High-volume offline data processing** – concurrency + dynamic batching + checkpointing + caching → reduces multi-day jobs to minutes.  
 2. **Real-time request handling** – dynamic concurrency, load balancing, rate limiting → keep latencies low and handle spikes.  
-3. **Agent or multi-step reasoning** – managing repeated LLM calls in a single user flow, or tool + LLM interplay.
-4. **Synthetic Data Generation** 
+3. **Agent or multi-step reasoning** – easily manage repeated LLM calls in a single user flow or tool + LLM pipeline.
+4. **Synthetic data generation** – quickly produce large amounts of synthetic text for training or testing.
 
-**Examples are using DeepSeek API** as they have **No Rate Limit** (or adapt to your preferred LLM provider).
+
+By default, examples show usage with DeepSeek (which has no explicit rate limit), but you can easily adapt to OpenAI or any other LLM provider by swapping in a different client class.
+
 
 ---
 
-### Highlights
+### Features
 
 - **Concurrency**: Uses Python’s `ThreadPoolExecutor` to make thousands of LLM calls in parallel, significantly reducing total runtime.  
-- **Batching**: Merge multiple items into a single LLM prompt to reduce API overhead costs like connection setup, TLS handshakes, HTTP request/response cycles, and network latency. Instead of paying these costs per item, our auto batching amortizes them across multiple items in one API call.
+- **Batching**: Merge multiple items into a single LLM prompt to reduce API overhead costs
 - **Caching**: Optionally cache and skip repeated prompts with on-disk JSON caching.  
 - **Retry**: Automatic exponential backoff for failures or rate-limit responses.  
 - **Dynamic Token Batching**: Automatically chunk items so total tokens stay below a configured limit.  
 - **Configurable**: A simple `ProcessorConfig` dataclass to set concurrency, batch size, dynamic token usage, etc.
+- **Checkpointing**: Save progress mid-run so you can resume large jobs if your script stops unexpectedly.
 
 ---
 
@@ -27,8 +30,8 @@ Built for:
 
 1. **Clone the repo**:
    ```bash
-   git clone https://github.com/yourname/my_llm_lib.git
-   cd my_llm_lib
+   git clone https://github.com/pkempire/hyperllm.git
+   cd hyperllm
    ```
 
 2. **Install dependencies**:
@@ -59,46 +62,47 @@ Built for:
 ## Quick Start
 
 ```python
+import os
 from llm_processor.processor import LLMProcessor
 from llm_processor.processor_config import ProcessorConfig
-from llm_processor.llm_client import BaseLLMClient
+from llm_processor.llm_client import DeepSeekClient  # or OpenAIClient, etc.
 
-# 1) Define or import your LLM client
-class FakeLLMClient(BaseLLMClient):
-    def call_api(self, prompt: str, system_prompt=None, **kwargs):
-        # Simulate an LLM call
-        return {"content": "Simulated response", "success": True}
+# 1) Prepare your LLM client
+api_key = os.getenv("DEEPSEEK_API_KEY") ##Or just string 
+client = DeepSeekClient(api_key=api_key, model="deepseek-chat", temperature=0.1)
 
-    def validate_response(self, response):
-        return True
-
-# 2) Create a config
+# 2) Create a configuration (batch size, concurrency, caching, etc.)
 config = ProcessorConfig(
-    max_workers=10,
-    batch_size=10,
+    max_workers=20,
+    batch_size=5,
     enable_batch_prompts=True,
-    enable_dynamic_token_batching=False,
+    cache_enabled=True,
+    max_retries=2,
     # ...
 )
 
-# 3) Create the processor
-client = FakeLLMClient()
+# 3) Initialize the LLMProcessor with your client
 processor = LLMProcessor(llm_client=client, config=config)
 
-# 4) Provide a "process function"
-def process_subbatch(batch_of_items):
-    # Build a single prompt from multiple items
-    prompt = "Combine these items:\n"
-    for it in batch_of_items:
-        prompt += f"- {it}\n"
-    response = client.call_api(prompt)
-    return {"batch_result": response}
+# 4) Define a processing function that calls the LLM
+def process_fn(prompt):
+    # Prepare system messages or additional parameters as needed
+    response = client.call_api(prompt=prompt, system_prompt="You are a helpful AI assistant.")
+    return response
 
-# 5) Run
-items = [f"Item {i}" for i in range(50)]
-results = processor.process_batch(items, process_subbatch)
-print(results)
-```
+# 5) Run the processor on a list of items (prompts)
+items = [
+    "What is the capital of France?",
+    "Explain quantum entanglement in simple terms.",
+    "Translate this sentence to Spanish: 'Hello World'.",
+    # ... more ...
+]
+
+results = processor.process_batch(items, process_fn, cache_prefix="demo_job")
+print("Done! Results:")
+for r in results:
+    print(r["content"])
+    ```
 
 ---
 

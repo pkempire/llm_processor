@@ -11,7 +11,7 @@ class ProcessorConfig:
     batch_size: int = 1
     max_workers: int = 10
     enable_batch_prompts: bool = False
-
+    
     # Dynamic token-based batching
     enable_dynamic_token_batching: bool = False
     max_tokens_per_batch: int = 2000
